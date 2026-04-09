@@ -417,9 +417,12 @@ ErrorCode Client::InitTransferEngine(
             // Use user-specified auto-discover setting
             auto_discover = env_auto_discover.value();
         } else {
-            // Enable auto-discover for RDMA if no devices are specified
-            if ((protocol == "rdma" || protocol == "efa") &&
-                !device_names.has_value()) {
+            // Enable auto-discover for RDMA if no devices are specified.
+            // EFA is excluded: auto_discover installs the RDMA transport which
+            // creates IBV_QPT_RC QPs that EFA devices don't support (EOPNOTSUPP).
+            // EFA topology discovery and transport installation are handled
+            // manually in the !auto_discover block below.
+            if (protocol == "rdma" && !device_names.has_value()) {
                 LOG(INFO)
                     << "Set auto discovery ON by default for RDMA protocol, "
                        "since no "
@@ -482,31 +485,35 @@ ErrorCode Client::InitTransferEngine(
         Transport* transport = nullptr;
 
         if (protocol == "rdma" || protocol == "efa") {
-            if (!device_names.has_value() || device_names->empty()) {
+            if (protocol == "rdma" &&
+                (!device_names.has_value() || device_names->empty())) {
                 LOG(ERROR) << "RDMA protocol requires device names when auto "
                               "discovery is disabled";
                 return ErrorCode::INVALID_PARAMS;
             }
 
-            LOG(INFO) << "Using specified RDMA devices: "
-                      << device_names.value();
-
-            std::vector<std::string> devices =
-                splitString(device_names.value(), ',', /*skip_empty=*/true);
-
-            // Manually discover topology with specified devices only
+            // Discover topology: use specified devices if provided, otherwise
+            // discover all (needed for EFA when no device name is given).
             auto topology = transfer_engine_->getLocalTopology();
             if (topology) {
-                topology->discover(devices);
-                LOG(INFO) << "Topology discovery complete with specified "
-                             "devices. Found "
+                if (device_names.has_value() && !device_names->empty()) {
+                    LOG(INFO) << "Using specified devices: "
+                              << device_names.value();
+                    std::vector<std::string> devices = splitString(
+                        device_names.value(), ',', /*skip_empty=*/true);
+                    topology->discover(devices);
+                } else {
+                    LOG(INFO) << "EFA protocol: discovering all local topology";
+                    topology->discover(std::vector<std::string>{});
+                }
+                LOG(INFO) << "Topology discovery complete. Found "
                           << topology->getHcaList().size() << " HCAs";
             }
 
             transport = transfer_engine_->installTransport(protocol, nullptr);
             if (!transport) {
-                LOG(ERROR) << "Failed to install RDMA transport with specified "
-                              "devices";
+                LOG(ERROR) << "Failed to install transport for protocol: "
+                           << protocol;
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "tcp") {
